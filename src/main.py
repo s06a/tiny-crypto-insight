@@ -40,6 +40,18 @@ cursor.execute("PRAGMA journal_mode=WAL;")
 cursor.execute("PRAGMA synchronous=NORMAL;")  # Optimize write speed
 conn.commit()
 
+async def ping_websocket(ws):
+    """
+    Periodically send a ping to the WebSocket to keep the connection alive.
+    """
+    while True:
+        try:
+            await ws.ping()
+            await asyncio.sleep(30)  # Ping every 30 seconds
+        except Exception as e:
+            print(f"❌ WebSocket Ping Error: {e}")
+            break
+
 def create_tables():
     """
     Create necessary SQLite tables if they don't exist.
@@ -170,6 +182,10 @@ async def fetch_binance_tickers():
                     print("✅ Connected to Binance WebSocket.")
 
                     while True:
+
+                        # Start WebSocket ping task
+                        asyncio.create_task(ping_websocket(ws))
+
                         try:
                             response = await ws.receive()
                             tickers = json.loads(response.data)
