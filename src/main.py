@@ -8,7 +8,7 @@ from aiohttp_socks import ProxyConnector
 from dotenv import load_dotenv
 import os
 
-# Define pathes
+# Define paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "binance_tickers.db")
@@ -28,8 +28,8 @@ else:
 if os.getenv("NETWORK_CONFIG"):
     NETWORK_CONFIG = os.getenv("NETWORK_CONFIG")
 
-# Binance WebSocket URL
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/!ticker@arr"
+# Binance WebSocket URL for Futures Market
+BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws/!ticker@arr"
 
 # Use a single shared connection (prevents locking)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -40,9 +40,9 @@ cursor.execute("PRAGMA journal_mode=WAL;")
 cursor.execute("PRAGMA synchronous=NORMAL;")  # Optimize write speed
 conn.commit()
 
-def create_table():
+def create_tables():
     """
-    Create the SQLite table if it doesn't exist.
+    Create necessary SQLite tables if they don't exist.
     """
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS binance_tickers (
@@ -56,23 +56,30 @@ def create_table():
     );
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_time ON binance_tickers(event_time);")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS volatility (
+        symbol TEXT PRIMARY KEY,
+        event_time INTEGER,
+        mean_price REAL,
+        volatility REAL
+    );
+    """)
+
     conn.commit()
-    print("✅ SQLite table is ready.")
+    print("✅ SQLite tables are ready.")
 
 async def save_to_sqlite(ticker):
     """
-    Insert Binance ticker data into SQLite (without proxy).
+    Insert Binance ticker data into SQLite.
     """
     try:
         symbol = ticker['s']
-
-        # Filter: Only process symbols ending with 'USDT'
-        if not symbol.endswith("USDT"):
-            return  # Skip if it's not a USDT pair
+        if not symbol.endswith("USDT"):  # Only process USDT pairs
+            return
 
         event_time = int(ticker['E'])  # Convert to integer (milliseconds)
 
-        # Insert data using shared connection (prevents locking)
         cursor.execute("""
         INSERT INTO binance_tickers (symbol, event_time, last_price, high_price, low_price, base_volume)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -92,41 +99,64 @@ async def save_to_sqlite(ticker):
 async def cleanup_old_data():
     """
     Deletes rows older than 10 minutes from SQLite to keep the database lightweight.
-    Runs every 5 minutes.
     """
     while True:
-        # Wait a few minutes before first cleanup
         await asyncio.sleep(300)  # Runs cleanup every 5 minutes
 
         try:
-            # Establish a NEW connection to prevent shared connection issues
-            conn_cleanup = sqlite3.connect(DB_PATH, isolation_level=None)
-            cursor_cleanup = conn_cleanup.cursor()
-
-            # Compute time cutoff (10 minutes ago in milliseconds)
             cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
-
-            # Delete old data
-            cursor_cleanup.execute("DELETE FROM binance_tickers WHERE event_time < ?", (cutoff_time,))
-            conn_cleanup.commit()
-            print(f"🗑️ Deleted rows older than 10 minutes.")
-
-            conn_cleanup.close()
+            conn.execute("DELETE FROM binance_tickers WHERE event_time < ?", (cutoff_time,))
+            conn.commit()
 
         except Exception as e:
-            print(f"❌ Cleanup error: {e}")
+            print(f"❌ Cleanup Error: {e}")
 
-async def ping_websocket(ws):
+async def compute_and_store_volatility():
     """
-    Periodically send a ping to the WebSocket to keep the connection alive.
+    Compute mean price and volatility for all symbols, updating existing records.
     """
     while True:
+        await asyncio.sleep(60)  # Compute volatility every 60 seconds
+
+        cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
+
         try:
-            await ws.ping()
-            await asyncio.sleep(30)  # Ping every 30 seconds to keep connection alive
+            conn.execute("""
+            REPLACE INTO volatility (symbol, event_time, mean_price, volatility)
+            SELECT 
+                symbol,
+                MAX(event_time) AS event_time,
+                AVG(last_price) AS mean_price,
+                CASE 
+                    WHEN COUNT(last_price) > 1 
+                    THEN COALESCE(SQRT(
+                        CASE 
+                            WHEN (AVG(last_price * last_price) - AVG(last_price) * AVG(last_price)) > 0 
+                            THEN (AVG(last_price * last_price) - AVG(last_price) * AVG(last_price)) 
+                            ELSE 0 
+                        END
+                    ), 0)
+                    ELSE 0 
+                END AS volatility
+            FROM binance_tickers
+            WHERE event_time >= ?
+            GROUP BY symbol
+            """, (cutoff_time,))
+
+            conn.commit()
+
+            # Fetch latest volatility data
+            results = conn.execute("SELECT symbol, mean_price, volatility FROM volatility ORDER BY volatility DESC LIMIT 10").fetchall()
+
+            print("\n📊 Updated Volatility for All Symbols:")
+            for row in results:
+                symbol = row[0]
+                mean_price = row[1] if row[1] is not None else 0.0
+                volatility = row[2] if row[2] is not None else 0.0
+                print(f"🔹 {symbol}: Mean = {mean_price:.2f}, Volatility = {volatility:.4f}")
+
         except Exception as e:
-            print(f"Ping error: {e}")
-            break
+            print(f"❌ SQLite Volatility Error: {e}")
 
 async def fetch_binance_tickers():
     """
@@ -134,10 +164,9 @@ async def fetch_binance_tickers():
     """
     while True:
         try:
-            # Use ProxyConnector for WebSocket if necessary
             connector = ProxyConnector.from_url(NETWORK_CONFIG) if NETWORK_CONFIG else None
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(BINANCE_WS_URL) as ws:
+                async with session.ws_connect(BINANCE_FUTURES_WS_URL) as ws:
                     print("✅ Connected to Binance WebSocket.")
 
                     while True:
@@ -164,11 +193,16 @@ async def fetch_binance_tickers():
             await asyncio.sleep(5)  # Wait before reconnecting
 
 async def main():
-    # Create SQLite table before starting
-    create_table()
+    """
+    Start WebSocket listener, periodic volatility computation, and cleanup.
+    """
+    create_tables()
 
-    # Start WebSocket, data fetching, and auto cleaning
-    await asyncio.gather(fetch_binance_tickers(), cleanup_old_data())
+    await asyncio.gather(
+        fetch_binance_tickers(),
+        compute_and_store_volatility(),
+        cleanup_old_data()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
