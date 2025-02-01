@@ -1,6 +1,6 @@
 # **Streamy** 🌊 
 
-**Streamy** (It's a temporary name, just for now) is a lightweight, real-time crypto data streamer with historical analysis capabilities.
+**Streamy** is a lightweight, real-time crypto data streamer with time series analysis capabilities.
 
 ---
 
