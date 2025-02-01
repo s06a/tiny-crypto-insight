@@ -1,7 +1,4 @@
-# **Streamy** 🌊 
-
-**Streamy** is a lightweight, real-time crypto data streamer with time series analysis capabilities.
-
+⚡ Streamy — Real-time crypto streaming & time-series analytics
 ---
 
 ## **✨ Features**
@@ -34,7 +31,8 @@ python src/main.py # or bash run.sh
 💡 **This will:**  
 - Connect to Binance WebSocket  
 - Store crypto ticker data in SQLite  
-- Automatically remove old data every 10 minutes  
+- Automatically remove old data every 10 minutes
+- Rank tickers based on volatility
 
 ---
 
