@@ -12,7 +12,7 @@ import pandas as pd
 # Define paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-DB_PATH = os.path.join(DATA_DIR, "binance_tickers.db")
+DB_PATH = os.path.join(DATA_DIR, "mexc_tickers.db")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 # Ensure "data" directory exists
@@ -29,8 +29,8 @@ else:
 if os.getenv("NETWORK_CONFIG"):
     NETWORK_CONFIG = os.getenv("NETWORK_CONFIG")
 
-# Binance WebSocket URL for Futures Market
-BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws/!ticker@arr"
+# MEXC Futures WebSocket URL
+MEXC_FUTURES_WS_URL = "wss://contract.mexc.com/edge"
 
 # Use a single shared connection (prevents locking)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
@@ -41,62 +41,6 @@ cursor.execute("PRAGMA journal_mode=WAL;")
 cursor.execute("PRAGMA synchronous=NORMAL;")  # Optimize write speed
 conn.commit()
 
-def create_tables():
-    """
-    Create necessary SQLite tables if they don't exist.
-    """
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS binance_tickers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        event_time INTEGER,  -- Store as Unix Timestamp
-        last_price REAL,
-        high_price REAL,
-        low_price REAL,
-        base_volume REAL
-    );
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_event_time ON binance_tickers(event_time);")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS volatility (
-        symbol TEXT PRIMARY KEY,
-        event_time INTEGER,
-        mean_price REAL,
-        volatility REAL
-    );
-    """)
-
-    conn.commit()
-    print("✅ SQLite tables are ready.")
-
-async def save_to_sqlite(ticker):
-    """
-    Insert Binance ticker data into SQLite.
-    """
-    try:
-        symbol = ticker['s']
-        if not symbol.endswith("USDT"):  # Only process USDT pairs
-            return
-
-        event_time = int(ticker['E'])  # Convert to integer (milliseconds)
-
-        cursor.execute("""
-        INSERT INTO binance_tickers (symbol, event_time, last_price, high_price, low_price, base_volume)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            event_time,
-            float(ticker['c']),  # last_price
-            float(ticker['h']),  # high_price
-            float(ticker['l']),  # low_price
-            float(ticker['v'])   # base_volume
-        ))
-        conn.commit()
-
-    except Exception as e:
-        print(f"❌ SQLite Insert Error: {e}")
-
 async def cleanup_old_data():
     """
     Deletes rows older than 10 minutes from SQLite to keep the database lightweight.
@@ -106,7 +50,7 @@ async def cleanup_old_data():
 
         try:
             cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
-            conn.execute("DELETE FROM binance_tickers WHERE event_time < ?", (cutoff_time,))
+            conn.execute("DELETE FROM mexc_tickers WHERE event_time < ?", (cutoff_time,))
             conn.commit()
 
         except Exception as e:
@@ -125,7 +69,7 @@ async def compute_and_store_volatility():
             # Fetch data from SQLite
             query = """
             SELECT symbol, event_time, last_price 
-            FROM binance_tickers 
+            FROM mexc_tickers 
             WHERE event_time >= ?
             """
             df = pd.read_sql_query(query, conn, params=(cutoff_time,))
@@ -142,7 +86,7 @@ async def compute_and_store_volatility():
                 # Calculate mean price
                 mean_price = group['last_price'].mean()
 
-                # Calculate daily returns and their standard deviation (volatility)
+                # Calculate returns and their standard deviation (volatility)
                 group['return'] = group['last_price'].pct_change()
                 volatility = group['return'].std() if len(group) > 1 else 0.0  # Avoid division by zero
 
@@ -179,40 +123,124 @@ async def compute_and_store_volatility():
         except Exception as e:
             print(f"❌ SQLite Volatility Error: {e}")
 
-async def fetch_binance_tickers():
+def create_tables():
     """
-    Connect to Binance WebSocket and insert data into SQLite.
+    Create necessary SQLite tables if they don't exist.
+    """
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS mexc_tickers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        event_time INTEGER,  -- Store as Unix Timestamp
+        last_price REAL,
+        rise_fall_rate REAL,
+        volume_24 REAL
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS volatility (
+        symbol TEXT PRIMARY KEY,
+        event_time INTEGER,
+        mean_price REAL,
+        volatility REAL
+    );
+    """)
+
+    conn.commit()
+    print("✅ SQLite tables are ready.")
+
+async def send_ping(ws):
+    """
+    Send a heartbeat 'ping' to keep the WebSocket connection alive.
+    """
+    while True:
+        await asyncio.sleep(30)  # Send ping every 30 seconds
+        try:
+            await ws.ping()  # Ping the server to keep connection alive
+        except Exception as e:
+            print(f"❌ Ping Error: {e}")
+            break
+
+async def save_to_sqlite(ticker):
+    """
+    Insert MEXC ticker data into SQLite, considering only symbols ending with 'USDT'.
+    """
+    try:
+        # Check if ticker is a dictionary and contains required fields
+        if not isinstance(ticker, dict) or 'symbol' not in ticker or 'lastPrice' not in ticker:
+            return
+
+        symbol = ticker['symbol']
+
+        # Only process symbols that end with 'USDT'
+        if not symbol.endswith('USDT'):
+            return
+
+        event_time = int(ticker['timestamp']) if 'timestamp' in ticker else int(time.time() * 1000)  # Use current time if 'timestamp' is missing
+
+        cursor.execute("""
+        INSERT INTO mexc_tickers (symbol, event_time, last_price, rise_fall_rate, volume_24)
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            symbol,
+            event_time,
+            float(ticker['lastPrice']),
+            float(ticker['riseFallRate']),
+            float(ticker['volume24'])
+        ))
+        conn.commit()
+
+    except Exception as e:
+        print(f"❌ SQLite Insert Error: {e}")
+
+async def fetch_mexc_tickers():
+    """
+    Connect to MEXC WebSocket and insert data into SQLite.
     """
     while True:
         try:
             connector = ProxyConnector.from_url(NETWORK_CONFIG) if NETWORK_CONFIG else None
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(BINANCE_FUTURES_WS_URL) as ws:
-                    print("✅ Connected to Binance WebSocket.")
+                async with session.ws_connect(MEXC_FUTURES_WS_URL) as ws:
+                    print("✅ Connected to MEXC WebSocket.")
+
+                    # Subscribe to MEXC tickers
+                    subscription_message = {
+                        "method": "sub.tickers",
+                        "param": {}
+                    }
+                    await ws.send_json(subscription_message)
+
+                    # Start the heartbeat ping task
+                    asyncio.create_task(send_ping(ws))
 
                     while True:
-
                         try:
-                            response = await ws.receive()
-                            tickers = json.loads(response.data)
+                            response = await ws.receive(timeout=60)  # Set a timeout for response
+                            if isinstance(response.data, str):
+                                message = json.loads(response.data)
 
-                            # Process tickers in smaller batches with a delay
-                            batch_size = 100
-                            for i in range(0, len(tickers), batch_size):
-                                batch = tickers[i:i + batch_size]
-                                tasks = [save_to_sqlite(ticker) for ticker in batch]
-                                await asyncio.gather(*tasks)
+                                if 'data' in message:
+                                    # Skip the message if data is 'success' (a string)
+                                    if isinstance(message['data'], str) and message['data'] == "success":
+                                        continue
 
-                        except websockets.exceptions.ConnectionClosedError:
-                            print("WebSocket connection closed. Reconnecting...")
-                            break  # Break to reconnect
+                                    tickers = message['data']
 
+                                    # Process each ticker (each is a dictionary in the list)
+                                    tasks = [save_to_sqlite(ticker) for ticker in tickers if isinstance(ticker, dict)]
+                                    await asyncio.gather(*tasks)
+                        except asyncio.TimeoutError:
+                            print("❌ WebSocket timeout. No response received.")
+                            break  # Reconnect on timeout
                         except Exception as e:
                             print(f"Error during WebSocket message handling: {e}")
-                            break  # Break to reconnect
+                            break  # Reconnect if any error occurs
         except Exception as e:
             print(f"Error: {e}. Retrying connection...")
             await asyncio.sleep(5)  # Wait before reconnecting
+
 
 async def main():
     """
@@ -221,7 +249,7 @@ async def main():
     create_tables()
 
     await asyncio.gather(
-        fetch_binance_tickers(),
+        fetch_mexc_tickers(),
         compute_and_store_volatility(),
         cleanup_old_data()
     )
