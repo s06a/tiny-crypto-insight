@@ -1,16 +1,16 @@
-⚡ Streamy — Real-time crypto streaming & time-series analytics
+⚡ Streamy — Real-time crypto streaming & insightful analytics
 ---
 
-## **✨ Features**
-✅ **Tiny & Efficient** – Minimal resource usage, runs on any device  
-✅ **Real-Time Data** – Streams live Binance ticker data  
-✅ **Historical Storage** – Saves price & volume in SQLite  
-✅ **Auto-Cleanup** – Deletes old data to keep the database light  
-✅ **Future-Ready** – Designed for ML, time-series analysis, and volatility tracking
+## **1. Features**
+- **Tiny & Efficient** – Minimal resource usage, runs on any device
+- **Real-Time Data** – Streams live MEXC ticker data  
+- **Historical Storage** – Saves tickers data in SQLite  
+- **Auto-Cleanup** – Deletes old data to keep the database light  
+- **Future-Ready** – Designed for ML and time-series analysis
 
 ---
 
-## **🚀 Installation**
+## **2. Installation**
 1️⃣ **Clone the repository**  
 ```sh
 git clone https://github.com/yourusername/streamy.git
@@ -23,18 +23,19 @@ pip install -r requirements.txt
 
 ---
 
-## **▶️ Running the App**
+## **3. Running the App**
 Start the crypto data streamer:  
 ```sh
 python src/main.py # or bash run.sh
 ```
 💡 **This will:**  
-- Connect to Binance WebSocket  
-- Store crypto ticker data in SQLite  
-- Automatically remove old data every 10 minutes
-- Rank tickers based on volatility
+- Connect to MEXC Futures WebSocket
+- Stream real-time crypto futures ticker data
+- Store crypto futures price, volume, and volatility in SQLite
+- Automatically remove old data every 10 minutes to keep the database light
+- Rank tickers based on volatility for better trading insights
 
 ---
 
-## **📜 License**
+## **4. License**
 MIT License – Free to use, modify & share
