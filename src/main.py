@@ -7,6 +7,7 @@ import time
 from aiohttp_socks import ProxyConnector
 from dotenv import load_dotenv
 import os
+import pandas as pd
 
 # Define paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,18 +40,6 @@ cursor = conn.cursor()
 cursor.execute("PRAGMA journal_mode=WAL;")
 cursor.execute("PRAGMA synchronous=NORMAL;")  # Optimize write speed
 conn.commit()
-
-async def ping_websocket(ws):
-    """
-    Periodically send a ping to the WebSocket to keep the connection alive.
-    """
-    while True:
-        try:
-            await ws.ping()
-            await asyncio.sleep(30)  # Ping every 30 seconds
-        except Exception as e:
-            print(f"❌ WebSocket Ping Error: {e}")
-            break
 
 def create_tables():
     """
@@ -125,7 +114,7 @@ async def cleanup_old_data():
 
 async def compute_and_store_volatility():
     """
-    Compute mean price and volatility for all symbols, updating existing records.
+    Compute mean price and volatility for all symbols using pandas, updating existing records.
     """
     while True:
         await asyncio.sleep(60)  # Compute volatility every 60 seconds
@@ -133,31 +122,51 @@ async def compute_and_store_volatility():
         cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
 
         try:
-            conn.execute("""
-            REPLACE INTO volatility (symbol, event_time, mean_price, volatility)
-            SELECT 
-                symbol,
-                MAX(event_time) AS event_time,
-                AVG(last_price) AS mean_price,
-                CASE 
-                    WHEN COUNT(last_price) > 1 
-                    THEN COALESCE(SQRT(
-                        CASE 
-                            WHEN (AVG(last_price * last_price) - AVG(last_price) * AVG(last_price)) > 0 
-                            THEN (AVG(last_price * last_price) - AVG(last_price) * AVG(last_price)) 
-                            ELSE 0 
-                        END
-                    ), 0)
-                    ELSE 0 
-                END AS volatility
-            FROM binance_tickers
+            # Fetch data from SQLite
+            query = """
+            SELECT symbol, event_time, last_price 
+            FROM binance_tickers 
             WHERE event_time >= ?
-            GROUP BY symbol
-            """, (cutoff_time,))
+            """
+            df = pd.read_sql_query(query, conn, params=(cutoff_time,))
+
+            if df.empty:
+                continue  # Skip if no data is available
+
+            # Group by symbol
+            grouped = df.groupby('symbol')
+
+            volatility_data = []
+
+            for symbol, group in grouped:
+                # Calculate mean price
+                mean_price = group['last_price'].mean()
+
+                # Calculate daily returns and their standard deviation (volatility)
+                group['return'] = group['last_price'].pct_change()
+                volatility = group['return'].std() if len(group) > 1 else 0.0  # Avoid division by zero
+
+                # Store result for this symbol
+                volatility_data.append({
+                    'symbol': symbol,
+                    'event_time': group['event_time'].max(),  # Most recent timestamp
+                    'mean_price': mean_price,
+                    'volatility': volatility
+                })
+
+            # Convert results to DataFrame
+            volatility_df = pd.DataFrame(volatility_data)
+
+            # Insert or update the volatility table
+            for _, row in volatility_df.iterrows():
+                cursor.execute("""
+                REPLACE INTO volatility (symbol, event_time, mean_price, volatility)
+                VALUES (?, ?, ?, ?)
+                """, (row['symbol'], row['event_time'], row['mean_price'], row['volatility']))
 
             conn.commit()
 
-            # Fetch latest volatility data
+            # Fetch top 10 most volatile symbols
             results = conn.execute("SELECT symbol, mean_price, volatility FROM volatility ORDER BY volatility DESC LIMIT 10").fetchall()
 
             print("\n📊 Updated Volatility for All Symbols:")
@@ -182,9 +191,6 @@ async def fetch_binance_tickers():
                     print("✅ Connected to Binance WebSocket.")
 
                     while True:
-
-                        # Start WebSocket ping task
-                        asyncio.create_task(ping_websocket(ws))
 
                         try:
                             response = await ws.receive()
