@@ -36,12 +36,10 @@ async def cleanup_old_data():
     """
     while True:
         await asyncio.sleep(300)  # Runs cleanup every 5 minutes
-
         try:
             cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
-            conn.execute("DELETE FROM mexc_tickers WHERE event_time < ?", (cutoff_time,))
+            cursor.execute("DELETE FROM mexc_tickers WHERE event_time < ?", (cutoff_time,))
             conn.commit()
-
         except Exception as e:
             print(f"❌ Cleanup Error: {e}")
 
@@ -55,7 +53,7 @@ async def compute_and_store_volatility():
         cutoff_time = int(time.time() * 1000) - (10 * 60 * 1000)
 
         try:
-            # Fetch data from SQLite
+            # Fetch data from SQLite in chunks to avoid memory overload
             query = """
             SELECT symbol, event_time, last_price 
             FROM mexc_tickers 
@@ -75,11 +73,15 @@ async def compute_and_store_volatility():
                 # Calculate mean price
                 mean_price = group['last_price'].mean()
 
-                # Calculate returns and their standard deviation (volatility)
-                group['return'] = group['last_price'].pct_change()
-                volatility = group['return'].std() if len(group) > 1 else 0.0  # Avoid division by zero
+                # Only calculate volatility if there are enough data points
+                if len(group) > 1:
+                    # Calculate returns and their standard deviation (volatility)
+                    group['return'] = group['last_price'].pct_change()
+                    volatility = group['return'].std() if len(group) > 1 else 0.0  # Avoid division by zero
+                else:
+                    volatility = 0.0
 
-                # Store result for this symbol
+                # Store result for this symbol, keeping track of the event time
                 volatility_data.append({
                     'symbol': symbol,
                     'event_time': group['event_time'].max(),  # Most recent timestamp
@@ -90,17 +92,30 @@ async def compute_and_store_volatility():
             # Convert results to DataFrame
             volatility_df = pd.DataFrame(volatility_data)
 
-            # Insert or update the volatility table
-            for _, row in volatility_df.iterrows():
-                cursor.execute("""
-                REPLACE INTO volatility (symbol, event_time, mean_price, volatility)
+            # Skip if no data to insert
+            if volatility_df.empty:
+                continue
+
+            # Insert new volatility data into the table (no replace)
+            with conn:
+                cursor.executemany("""
+                INSERT INTO volatility (symbol, event_time, mean_price, volatility)
                 VALUES (?, ?, ?, ?)
-                """, (row['symbol'], row['event_time'], row['mean_price'], row['volatility']))
+                """, [(row['symbol'], row['event_time'], row['mean_price'], row['volatility']) for _, row in volatility_df.iterrows()])
 
-            conn.commit()
-
-            # Fetch top 10 most volatile symbols
-            results = conn.execute("SELECT symbol, mean_price, volatility FROM volatility ORDER BY volatility DESC LIMIT 10").fetchall()
+            # Fetch top 10 most volatile symbols ranked based on the latest data
+            query = """
+            SELECT symbol, mean_price, volatility
+            FROM (
+                SELECT symbol, mean_price, volatility,
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY event_time DESC) AS rn
+                FROM volatility
+            ) AS subquery
+            WHERE rn = 1
+            ORDER BY volatility DESC
+            LIMIT 10
+            """
+            results = conn.execute(query).fetchall()
 
             print("\n📊 Updated Volatility for All Symbols:")
             for row in results:
@@ -111,6 +126,7 @@ async def compute_and_store_volatility():
 
         except Exception as e:
             print(f"❌ SQLite Volatility Error: {e}")
+
 
 def create_tables():
     """
@@ -151,35 +167,24 @@ async def send_ping(ws):
             print(f"❌ Ping Error: {e}")
             break
 
-async def save_to_sqlite(ticker):
+async def save_to_sqlite(ticker_batch):
     """
-    Insert MEXC ticker data into SQLite, considering only symbols ending with 'USDT'.
+    Insert MEXC ticker data into SQLite in batches.
     """
     try:
-        # Check if ticker is a dictionary and contains required fields
-        if not isinstance(ticker, dict) or 'symbol' not in ticker or 'lastPrice' not in ticker:
-            return
-
-        symbol = ticker['symbol']
-
-        # Only process symbols that end with 'USDT'
-        if not symbol.endswith('USDT'):
-            return
-
-        event_time = int(ticker['timestamp']) if 'timestamp' in ticker else int(time.time() * 1000)  # Use current time if 'timestamp' is missing
-
-        cursor.execute("""
-        INSERT INTO mexc_tickers (symbol, event_time, last_price, rise_fall_rate, volume_24)
-        VALUES (?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            event_time,
-            float(ticker['lastPrice']),
-            float(ticker['riseFallRate']),
-            float(ticker['volume24'])
-        ))
-        conn.commit()
-
+        with conn:
+            for ticker in ticker_batch:
+                if ticker['symbol'].endswith('USDT'):
+                    cursor.execute("""
+                    INSERT INTO mexc_tickers (symbol, event_time, last_price, rise_fall_rate, volume_24)
+                    VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        ticker['symbol'],
+                        ticker['timestamp'],
+                        float(ticker['lastPrice']),
+                        float(ticker['riseFallRate']),
+                        float(ticker['volume24'])
+                    ))
     except Exception as e:
         print(f"❌ SQLite Insert Error: {e}")
 
@@ -192,42 +197,37 @@ async def fetch_mexc_tickers():
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(MEXC_FUTURES_WS_URL) as ws:
                     print("✅ Connected to MEXC WebSocket.")
-
-                    # Subscribe to MEXC tickers
                     subscription_message = {
                         "method": "sub.tickers",
                         "param": {}
                     }
                     await ws.send_json(subscription_message)
-
-                    # Start the heartbeat ping task
                     asyncio.create_task(send_ping(ws))
 
+                    ticker_batch = []
                     while True:
                         try:
-                            response = await ws.receive(timeout=60)  # Set a timeout for response
+                            response = await ws.receive(timeout=60)
                             if isinstance(response.data, str):
                                 message = json.loads(response.data)
-
                                 if 'data' in message:
-                                    # Skip the message if data is 'success' (a string)
                                     if isinstance(message['data'], str) and message['data'] == "success":
                                         continue
-
                                     tickers = message['data']
-
-                                    # Process each ticker (each is a dictionary in the list)
-                                    tasks = [save_to_sqlite(ticker) for ticker in tickers if isinstance(ticker, dict)]
-                                    await asyncio.gather(*tasks)
+                                    for ticker in tickers:
+                                        ticker_batch.append(ticker)
+                                    if len(ticker_batch) >= 100:
+                                        await save_to_sqlite(ticker_batch)
+                                        ticker_batch.clear()
                         except asyncio.TimeoutError:
-                            print("❌ WebSocket timeout. No response received.")
-                            break  # Reconnect on timeout
+                            print("❌ WebSocket timeout.")
+                            break
                         except Exception as e:
                             print(f"Error during WebSocket message handling: {e}")
-                            break  # Reconnect if any error occurs
+                            break
         except Exception as e:
             print(f"Error: {e}. Retrying connection...")
-            await asyncio.sleep(5)  # Wait before reconnecting
+            await asyncio.sleep(5)
 
 
 async def main():
