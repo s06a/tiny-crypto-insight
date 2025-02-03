@@ -13,21 +13,10 @@ import pandas as pd
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "mexc_tickers.db")
-ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 # Ensure "data" directory exists
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
-
-# Load .env
-if os.path.exists(ENV_PATH):
-    load_dotenv(ENV_PATH)
-else:
-    print(f"⚠️ Warning: .env file not found at {ENV_PATH}")
-
-# Load variables from .env
-if os.getenv("NETWORK_CONFIG"):
-    NETWORK_CONFIG = os.getenv("NETWORK_CONFIG")
 
 # MEXC Futures WebSocket URL
 MEXC_FUTURES_WS_URL = "wss://contract.mexc.com/edge"
@@ -200,8 +189,7 @@ async def fetch_mexc_tickers():
     """
     while True:
         try:
-            connector = ProxyConnector.from_url(NETWORK_CONFIG) if NETWORK_CONFIG else None
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(MEXC_FUTURES_WS_URL) as ws:
                     print("✅ Connected to MEXC WebSocket.")
 
